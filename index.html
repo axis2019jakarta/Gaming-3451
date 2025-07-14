@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Dark Fantasy - Game Prototype</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: 'Courier New', Courier, monospace;
+            color: white;
+        }
+        #game-container {
+            position: relative;
+        }
+        canvas {
+            background-color: #111;
+            display: block;
+        }
+        #info-overlay {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.5);
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid #444;
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <canvas id="gameCanvas"></canvas>
+        <div id="info-overlay">
+            <b>Kontrol:</b><br>
+            Panah Kiri/Kanan: Bergerak<br>
+            Spasi: Serang
+        </div>
+    </div>
+
+    <script>
+        // --- SETUP KANVAS ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = 960;
+        canvas.height = 540;
+
+        // --- MANAJEMEN ASET ---
+        const ASSETS = {
+            player: 'https://i.imgur.com/GZ5yL9q.png',
+            enemy: 'https://i.imgur.com/oYi5s5G.png',
+            background: 'https://i.imgur.com/gKkPqA5.jpeg',
+            props: 'https://i.imgur.com/h5T2Bv8.png'
+        };
+
+        const images = {};
+        let assetsLoaded = 0;
+        let totalAssets = Object.keys(ASSETS).length;
+
+        function onAssetLoad() {
+            assetsLoaded++;
+            if (assetsLoaded === totalAssets) {
+                startGame();
+            }
+        }
+
+        for (const key in ASSETS) {
+            images[key] = new Image();
+            images[key].src = ASSETS[key];
+            images[key].onload = onAssetLoad;
+        }
+
+        // --- INPUT HANDLER ---
+        const keys = {
+            ArrowRight: false,
+            ArrowLeft: false,
+            Space: false
+        };
+        window.addEventListener('keydown', e => {
+            if (e.code in keys) keys[e.code] = true;
+        });
+        window.addEventListener('keyup', e => {
+            if (e.code in keys) keys[e.code] = false;
+        });
+        
+        // --- KONFIGURASI GAME ---
+        let gameState = 'loading'; // 'loading', 'playing', 'gameOver'
+        let enemies = [];
+        let particles = [];
+        const floorY = canvas.height - 100;
+
+        // --- PETA SPRITE (Perkiraan posisi & ukuran dari aset) ---
+        const SPRITE_MAP = {
+            player: {
+                idle:   { y: 150, frames: 7, w: 65, h: 75, speed: 10 },
+                walk:   { y: 0,   frames: 9, w: 65, h: 75, speed: 6 },
+                attack: { y: 240, frames: 4, w: 90, h: 75, speed: 5 } // Menggunakan baris bawah untuk serangan
+            },
+            enemy: {
+                walk:   { y: 125, frames: 8, w: 90, h: 100, speed: 8 },
+                hurt:   { y: 125, frames: 1, w: 90, h: 100, speed: 10} // Hanya diam sejenak
+            }
+        };
+
+        // --- OBJEK GAME (FACTORY PATTERN) ---
+        function createPlayer() {
+            return {
+                x: 150, y: floorY,
+                w: 65, h: 75,
+                scale: 1.8,
+                speed: 3,
+                hp: 100, maxHp: 100,
+                state: 'idle',
+                flip: false,
+                frame: 0,
+                frameTimer: 0,
+                isAttacking: false,
+                attackBox: { x: 0, y: 0, w: 90, h: 75 },
+                
+                update() {
+                    // Penentuan state
+                    if (this.isAttacking) {
+                        this.state = 'attack';
+                    } else if (keys.ArrowRight || keys.ArrowLeft) {
+                        this.state = 'walk';
+                    } else {
+                        this.state = 'idle';
+                    }
+                    
+                    // Serangan
+                    if (keys.Space && !this.isAttacking) {
+                        this.isAttacking = true;
+                        this.frame = 0;
+                    }
+
+                    // Gerakan
+                    if (this.state === 'walk' && !this.isAttacking) {
+                        if (keys.ArrowRight) {
+                            this.x += this.speed;
+                            this.flip = false;
+                        }
+                        if (keys.ArrowLeft) {
+                            this.x -= this.speed;
+                            this.flip = true;
+                        }
+                    }
+                    
+                    // Animasi
+                    const anim = SPRITE_MAP.player[this.state];
+                    this.frameTimer++;
+                    if (this.frameTimer > anim.speed) {
+                        this.frameTimer = 0;
+                        this.frame++;
+                        if (this.frame >= anim.frames) {
+                            if (this.state === 'attack') {
+                                this.isAttacking = false;
+                            }
+                            this.frame = 0;
+                        }
+                    }
+                    
+                    // Update attack hitbox
+                    const attackW = this.attackBox.w * this.scale;
+                    this.attackBox.x = this.flip ? this.x - attackW + 30 : this.x + 30;
+                    this.attackBox.y = this.y;
+                }
+            };
+        }
+
+        function createEnemy(x) {
+            return {
+                x: x, y: floorY - 25,
+                w: 90, h: 100,
+                scale: 1.8,
+                speed: 0.8,
+                direction: -1, // -1 kiri, 1 kanan
+                hp: 50, maxHp: 50,
+                state: 'walk',
+                flip: true,
+                frame: 0,
+                frameTimer: 0,
+                isHurt: 0, // durasi hurt
+                
+                update() {
+                    if(this.isHurt > 0) {
+                        this.isHurt--;
+                        return; // Berhenti bergerak saat terluka
+                    }
+                    
+                    this.x += this.speed * this.direction;
+                    if (this.x < 400 || this.x > canvas.width - 100) {
+                        this.direction *= -1;
+                        this.flip = this.direction === -1;
+                    }
+                    
+                    const anim = SPRITE_MAP.enemy.walk;
+                    this.frameTimer++;
+                    if(this.frameTimer > anim.speed){
+                        this.frameTimer = 0;
+                        this.frame = (this.frame + 1) % anim.frames;
+                    }
+                },
+                
+                takeDamage(amount) {
+                    if (this.hp <= 0) return;
+                    this.hp -= amount;
+                    this.isHurt = 15; // Berhenti selama 15 frame
+                    createParticles(this.x + (this.w / 2), this.y + (this.h / 2));
+                    if(this.hp <= 0) {
+                        this.state = 'dead';
+                    }
+                }
+            };
+        }
+        
+        function createParticles(x, y) {
+            for(let i = 0; i < 5; i++) {
+                particles.push({
+                    x, y,
+                    vx: (Math.random() - 0.5) * 4,
+                    vy: (Math.random() - 0.5) * 4,
+                    life: 30,
+                    color: 'rgba(255, 80, 80, 0.8)'
+                });
+            }
+        }
+
+        let player = createPlayer();
+
+        // --- FUNGSI MENGGAMBAR ---
+        function drawSprite(obj) {
+            const animData = SPRITE_MAP[obj.type][obj.state];
+            const sx = obj.frame * animData.w;
+            const sy = animData.y;
+            const sw = animData.w;
+            const sh = animData.h;
+            const dw = sw * obj.scale;
+            const dh = sh * obj.scale;
+
+            ctx.save();
+            if (obj.flip) {
+                ctx.scale(-1, 1);
+                ctx.translate(-obj.x - dw, obj.y);
+            } else {
+                ctx.translate(obj.x, obj.y);
+            }
+            ctx.drawImage(images[obj.type], sx, sy, sw, sh, 0, 0, dw, dh);
+            ctx.restore();
+        }
+        
+        function drawHealthBar(obj) {
+            const barW = 60;
+            const barH = 8;
+            const barX = obj.x + (obj.w * obj.scale / 2) - (barW / 2);
+            const barY = obj.y - 20;
+            
+            ctx.fillStyle = '#333';
+            ctx.fillRect(barX, barY, barW, barH);
+            
+            const hpW = (obj.hp / obj.maxHp) * barW;
+            ctx.fillStyle = obj.hp > 30 ? '#4CAF50' : '#F44336';
+            ctx.fillRect(barX, barY, hpW > 0 ? hpW : 0, barH);
+            
+            ctx.strokeStyle = '#fff';
+            ctx.strokeRect(barX, barY, barW, barH);
+        }
+
+        // --- LOGIKA UTAMA ---
+        function update() {
+            if (gameState !== 'playing') return;
+
+            player.update();
+            
+            // Cek tabrakan serangan
+            if(player.state === 'attack' && player.frame === 2) { // Cek di frame puncak serangan
+                enemies.forEach(enemy => {
+                    if(enemy.hp > 0 &&
+                       player.attackBox.x < enemy.x + (enemy.w * enemy.scale) &&
+                       player.attackBox.x + player.attackBox.w > enemy.x &&
+                       player.attackBox.y < enemy.y + (enemy.h * enemy.scale) &&
+                       player.attackBox.y + player.attackBox.h > enemy.y
+                    ) {
+                        enemy.takeDamage(25);
+                    }
+                });
+            }
+
+            enemies.forEach(e => e.update());
+            
+            // Cek tabrakan musuh dengan pemain
+            enemies.forEach(enemy => {
+                if (enemy.hp > 0 && player.hp > 0 && Math.abs(player.x - enemy.x) < 50) {
+                    player.hp -= 0.5;
+                    if (player.hp <= 0) {
+                        gameState = 'gameOver';
+                    }
+                }
+            });
+            
+            // Hapus musuh yang mati
+            enemies = enemies.filter(e => e.hp > 0);
+            
+            // Update partikel
+            particles.forEach((p, index) => {
+                p.x += p.vx;
+                p.y += p.vy;
+                p.life--;
+                if(p.life <= 0) particles.splice(index, 1);
+            });
+            
+            // Spawn musuh baru
+            if (enemies.length < 2 && Math.random() < 0.01) {
+                enemies.push(createEnemy(canvas.width));
+            }
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // Gambar latar belakang
+            ctx.drawImage(images.background, 0, 0, canvas.width, canvas.height);
+            
+            // Gambar properti lingkungan (batu nisan)
+            // (sx, sy, sw, sh, dx, dy, dw, dh)
+            ctx.drawImage(images.props, 30, 20, 100, 110, 50, floorY - 40, 100, 110);
+            ctx.drawImage(images.props, 290, 180, 50, 70, 300, floorY, 50, 70);
+            ctx.drawImage(images.props, 290, 180, 50, 70, 800, floorY, 50, 70);
+
+
+            // Gambar semua entitas
+            enemies.forEach(enemy => {
+                drawSprite({ ...enemy, type: 'enemy' });
+                if(enemy.hp > 0) drawHealthBar(enemy);
+            });
+
+            drawSprite({ ...player, type: 'player' });
+            if(player.hp > 0) drawHealthBar(player);
+            
+            // Gambar partikel
+            particles.forEach(p => {
+                ctx.fillStyle = p.color;
+                ctx.fillRect(p.x, p.y, 4, 4);
+            });
+
+            if (gameState === 'gameOver') {
+                ctx.fillStyle = 'rgba(0,0,0,0.7)';
+                ctx.fillRect(0,0, canvas.width, canvas.height);
+                ctx.fillStyle = 'red';
+                ctx.font = '60px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2);
+                ctx.fillStyle = 'white';
+                ctx.font = '20px sans-serif';
+                ctx.fillText('Tekan F5 untuk memulai lagi', canvas.width / 2, canvas.height / 2 + 40);
+            } else if (gameState === 'loading') {
+                ctx.fillStyle = 'white';
+                ctx.font = '30px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('Memuat Aset...', canvas.width / 2, canvas.height / 2);
+            }
+        }
+
+        // --- GAME LOOP ---
+        function gameLoop() {
+            update();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // --- INISIALISASI GAME ---
+        function startGame() {
+            player = createPlayer();
+            enemies = [createEnemy(canvas.width - 150)];
+            gameState = 'playing';
+            gameLoop();
+        }
+    </script>
+</body>
+</html>
